@@ -6,7 +6,8 @@ import os
 from torchvision import transforms
 from PIL import Image
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast
-from custom_datasets import BrunelloImageDataModule, collate_fn
+from custom_datasets import BrunelloImageDataModule, collate_fn, HMImageDataModule
+import json
 
 # Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -24,20 +25,25 @@ def load_image(image_path, transform=None):
 
 def main():
     # Image preprocessing
-    transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        ]
-    )
-    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2",)
-    data_module = BrunelloImageDataModule(
-        tokenizer=tokenizer, batch_size=1, num_workers=1, collate=collate_fn,
-    )
-    data_module.setup()
-    test_loader = data_module.test_dataloader()
+    brunello = False
 
-    checkpoint = "BEST_checkpoint_brunello_loadgpt.pth.tar"  # model checkpoint
+    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2",)
+
+    if brunello:
+        data_module = BrunelloImageDataModule(
+            tokenizer=tokenizer, batch_size=1, num_workers=1, collate=collate_fn,
+        )
+        data_module.setup()
+        test_loader = data_module.test_dataloader()
+        checkpoint = "BEST_checkpoint_brunello_loadgpt.pth.tar"  # model checkpoint
+    else:
+        data_module = HMImageDataModule(
+            tokenizer=tokenizer, batch_size=1, num_workers=1, collate=collate_fn,
+        )
+        data_module.setup()
+        test_loader = data_module.small_test_dataloader()
+        checkpoint = "BEST_checkpoint_hm_loadgpt.pth.tar"
+
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )  # sets device for model and PyTorch tensors
@@ -59,17 +65,12 @@ def main():
     # # Prepare an image
     # image = load_image(args.image, transform)
     # image_tensor = image.to(device)
+    results = {}
+    for batch_idx, (image, captions, lengths) in enumerate(test_loader):
 
-    for i, (image, captions, lengths) in enumerate(test_loader):
-        # images = images.to(device)
-        # # Generate an caption from the image
-        # feature = encoder(images)
-        # sampled_ids = decoder.sample(feature)
-        # sampled_ids = (
-        #     sampled_ids[0].cpu().numpy()
-        # )  # (1, max_seq_length) -> (max_seq_length)
-        # sentence = tokenizer.decode(sampled_ids)
-        # print(sentence)
+        if not (batch_idx % 10):
+            print(batch_idx)
+
         k = beam_size
 
         # Move to GPU device, if available
@@ -179,8 +180,24 @@ def main():
 
         i = complete_seqs_scores.index(max(complete_seqs_scores))
         seq = complete_seqs[i]
-        print(seq)
-        break
+        # generated_sequence_list = seq.tolist()
+        # Decode text
+        gen_text = tokenizer.decode(seq, clean_up_tokenization_spaces=True)
+        # Remove all text after the stop token
+        gen_text = gen_text.replace("<|endoftext|>.", "").replace("<|endoftext|>", "")
+        original = tokenizer.decode(
+            captions.tolist()[0], clean_up_tokenization_spaces=True
+        )
+        original = original.replace("<|endoftext|>.", "").replace("<|endoftext|>", "")
+        if brunello:
+            key = test_loader.dataset.index2img[batch_idx]
+        else:
+            key = test_loader.dataset.idxtoImgid[batch_idx]
+        results[key] = {"original": original}
+        results[key]["generated"] = gen_text
+
+    with open("attention_baseline_{}.json".format(brunello), "w") as f:
+        json.dump(results, f, indent=4)
 
 
 if __name__ == "__main__":

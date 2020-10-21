@@ -195,8 +195,6 @@ def collate_fn(data):
         end = lengths[i]
         targets[i, :end] = cap[:end]
     lengths = torch.LongTensor(lengths).unsqueeze(1)
-    print(lengths.shape)
-    print(targets.shape)
     return images, targets, lengths
 
 
@@ -311,7 +309,7 @@ class BrunelloImageDataModule(LightningDataModule):
             self.test_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            shuffle=True,
+            shuffle=False,
             drop_last=True,
             collate_fn=self.collate,
         )
@@ -321,3 +319,212 @@ class BrunelloImageDataModule(LightningDataModule):
 
     def get_attr_names(self):
         return self.attrs_names
+
+
+class HMDataset(VisionDataset):
+    """H&M Dataset"""
+
+    def __init__(
+        self,
+        tokenizer,
+        base_path: str,
+        csv_file: str,
+        num_attributes=255,
+        transforms=None,
+        nrows=None,
+        eostoken="<|endoftext|>",
+    ) -> None:
+        """
+        Args:
+            csv_file (string): Path to the hm_dataset.csv
+
+            base_path (string): Directory with all the images.
+
+            transform (callable, optional): Optional transform to be applied
+                on a sample.
+        """
+        self.df = pd.read_csv(os.path.join(base_path, csv_file), nrows=nrows)
+        self.base_path = base_path
+        self.transforms = transforms
+        self.num_attributes = num_attributes
+        self.tokenizer = tokenizer
+        self.eostoken = eostoken
+        self.idxtoImgid = {k: v for k, v in enumerate(self.df["ImageId"])}
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx: int):
+        sample = self.df.iloc[idx]
+        img_name = os.path.join(
+            self.base_path,
+            "img",
+            str(sample["Assortmenttype"]),
+            str(sample["ImageId"]) + ".jpg",
+        )
+        image = Image.open(img_name).convert("RGB")
+
+        # category = int(sample["CatId"])
+
+        # attributes = torch.zeros(self.num_attributes, dtype=torch.uint8)
+
+        # attr_ids = sample["AttributesIds"]
+        # if attr_ids:
+        #     attr_ids = [int(attr) for attr in str(attr_ids).split(",")]
+        #     attributes[attr_ids] = 1
+
+        if self.transforms is not None:
+            image = self.transforms(image)
+
+        # target = {}
+        # target["image_id"] = torch.tensor([sample["ImageId"]], dtype=torch.int64)
+        # target["classes"] = torch.as_tensor(category, dtype=torch.int64)
+        # # ret["attr"] = torch.as_tensor(attributes, dtype=torch.uint8)
+        # target["attrs"] = attributes
+        # target["desc"] = sample["Description"]
+        desc = sample["Description"]
+        text_labels = self.tokenizer(desc, padding=False, return_tensors="pt")[
+            "input_ids"
+        ]
+        pad_id = (
+            torch.tensor(
+                self.tokenizer.convert_tokens_to_ids("<|endoftext|>"),
+                dtype=text_labels.dtype,
+            )
+            .unsqueeze(0)
+            .unsqueeze(0)
+        )
+        text_labels = torch.cat((pad_id, text_labels), dim=-1)
+        target = torch.cat((text_labels, pad_id), dim=-1)
+        target = target.squeeze(0)
+
+        return image, target
+
+
+class HMImageDataModule(LightningDataModule):
+    """DataModule that sets loaders for tagging and captioning."""
+
+    def __init__(
+        self,
+        tokenizer,
+        batch_size: int,
+        num_workers: int,
+        base_path: str = "data/hm",
+        train_split_size: float = 0.8,
+        collate: Callable[
+            [List[Tuple[Tensor, TargetType]]], Tuple[Tensor, TargetType]
+        ] = None,
+        nrows=None,
+        **dataset_kwargs,
+    ):
+        super().__init__()
+        self.base_path = base_path
+        self.train_split_size = train_split_size
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.collate = collate
+        self.nrows = nrows
+        self.tokenizer = tokenizer
+
+        # with open(os.path.join(base_path, "new_categories.json"), "r") as fp:
+        #     self.category_mapping = json.load(fp)
+
+        # with open(os.path.join(base_path, "new_attributes.json"), "r") as fp:
+        #     self.attributes_mapping = json.load(fp)
+
+    def setup(self, stage=None):
+        """Set up datasets."""
+        # Assign train/val datasets for use in dataloaders
+        normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
+        self.train_transformations = transforms.Compose(
+            [
+                transforms.Resize((224, 224)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ]
+        )
+        self.test_transformations = transforms.Compose(
+            [transforms.Resize((224, 224)), transforms.ToTensor(), normalize]
+        )
+        # if stage == "fit" or stage is None:
+        dataset = HMDataset(
+            self.tokenizer,
+            self.base_path,
+            "train_hm_dataset.csv",
+            transforms=self.train_transformations,
+            nrows=self.nrows,
+        )
+        train_len = int(self.train_split_size * len(dataset))
+        self.train, self.val = random_split(
+            dataset, (train_len, len(dataset) - train_len)
+        )
+
+        # Assign test dataset for use in dataloader(s)
+        # if stage == "test" or stage is None and self.test_dir is not None:
+        self.test = HMDataset(
+            self.tokenizer,
+            self.base_path,
+            "test_hm_dataset.csv",
+            transforms=self.test_transformations,
+            nrows=self.nrows,
+        )
+        self.small_test = HMDataset(
+            self.tokenizer,
+            self.base_path,
+            "small_test_hm_dataset.csv",
+            transforms=self.test_transformations,
+            nrows=self.nrows,
+        )
+
+    def train_dataloader(self):
+        """Return dataloader wrapping train dataset."""
+        return DataLoader(
+            self.train,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
+            drop_last=True,
+            collate_fn=self.collate,
+        )
+
+    def val_dataloader(self):
+        """Return dataloader wrapping validation dataset."""
+        return DataLoader(
+            self.val,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+            drop_last=True,
+            collate_fn=self.collate,
+        )
+
+    def test_dataloader(self):
+        """Return dataloader wrapping test dataset."""
+        return DataLoader(
+            self.test,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+            drop_last=True,
+            collate_fn=self.collate,
+        )
+
+    def small_test_dataloader(self):
+        """Return dataloader wrapping test dataset."""
+        return DataLoader(
+            self.small_test,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+            drop_last=True,
+            collate_fn=self.collate,
+        )
+
+    def get_class_names(self):
+        return list(self.category_mapping.keys())
+
+    def get_attr_names(self):
+        return list(self.attributes_mapping.keys())

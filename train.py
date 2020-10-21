@@ -10,17 +10,17 @@ from models import Encoder, DecoderWithAttention
 
 # from datasets import *
 from utils import *
-from nltk.translate.bleu_score import corpus_bleu
+
+# from nltk.translate.bleu_score import corpus_bleu
 
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast
-from custom_datasets import BrunelloImageDataModule, collate_fn
+from custom_datasets import BrunelloImageDataModule, collate_fn, HMImageDataModule
 
 # # Data parameters
 # data_folder = (
 #     "/media/ssd/caption data"  # folder with data files saved by create_input_files.py
 # )
-data_name = "brunello_loadgpt"  # base name shared by data files
-base_path = "data/hm"
+
 
 # Model parameters
 emb_dim = 512  # dimension of word embeddings
@@ -34,7 +34,7 @@ cudnn.benchmark = True  # set to true only if inputs to model are fixed size; ot
 
 # Training parameters
 start_epoch = 0
-epochs = 15  # number of epochs to train for (if early stopping is not triggered)
+epochs = 1  # number of epochs to train for (if early stopping is not triggered)
 epochs_since_improvement = 0  # keeps track of number of epochs since there's been an improvement in validation BLEU
 batch_size = 8
 workers = 4  # for data-loading; right now, only 1 works with h5py
@@ -45,9 +45,12 @@ alpha_c = (
     1.0  # regularization parameter for 'doubly stochastic attention', as in the paper
 )
 best_bleu4 = 0.0  # BLEU-4 score right now
+best_val_loss = float("inf")
 print_freq = 100  # print training/validation stats every __ batches
-fine_tune_encoder = False  # fine-tune encoder?
+fine_tune_encoder = True  # fine-tune encoder?
 checkpoint = None  # path to checkpoint, None if none
+load_gpt = True
+brunello = False
 
 
 def main():
@@ -58,9 +61,11 @@ def main():
     torch.manual_seed(0)
     np.random.seed(0)
 
-    global best_bleu4, epochs_since_improvement, checkpoint, start_epoch, fine_tune_encoder, data_name, word_map
-
-    load_gpt = True
+    global best_bleu4, epochs_since_improvement, checkpoint, start_epoch, fine_tune_encoder, word_map, best_val_loss, load_gpt, brunello
+    dataset_name = "brun" if brunello else "hm"
+    data_name = "{}_loadgpt".format(dataset_name)  # base name shared by data files
+    print(data_name)
+    # base_path = "data/hm"
 
     # Load vocabulary wrapper
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2",)
@@ -77,20 +82,23 @@ def main():
     attention_dim = embed_size  # dimension of attention linear layers
     decoder_dim = embed_size  # dimension of decoder RNN
 
-    data_module = BrunelloImageDataModule(
-        tokenizer=tokenizer,
-        batch_size=batch_size,
-        num_workers=workers,
-        collate=collate_fn,
-    )
+    if brunello:
+        data_module = BrunelloImageDataModule(
+            tokenizer=tokenizer,
+            batch_size=batch_size,
+            num_workers=workers,
+            collate=collate_fn,
+        )
+    else:
+        data_module = HMImageDataModule(
+            tokenizer=tokenizer,
+            batch_size=batch_size,
+            num_workers=workers,
+            collate=collate_fn,
+        )
     data_module.setup()
     train_loader = data_module.train_dataloader()
     val_loader = data_module.val_dataloader()
-
-    # # Read word map
-    # word_map_file = os.path.join(data_folder, "WORDMAP_" + data_name + ".json")
-    # with open(word_map_file, "r") as j:
-    #     word_map = json.load(j)
 
     # Initialize / load checkpoint
     if checkpoint is None:
@@ -123,7 +131,7 @@ def main():
         checkpoint = torch.load(checkpoint)
         start_epoch = checkpoint["epoch"] + 1
         epochs_since_improvement = checkpoint["epochs_since_improvement"]
-        best_bleu4 = checkpoint["bleu-4"]
+        best_val_loss = checkpoint["bleu-4"]
         decoder = checkpoint["decoder"]
         decoder_optimizer = checkpoint["decoder_optimizer"]
         encoder = checkpoint["encoder"]
@@ -142,35 +150,13 @@ def main():
     # Loss function
     criterion = nn.CrossEntropyLoss().to(device)
 
-    # # Custom dataloaders
-    # normalize = transforms.Normalize(
-    #     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-    # )
-    # train_loader = torch.utils.data.DataLoader(
-    #     CaptionDataset(
-    #         data_folder, data_name, "TRAIN", transform=transforms.Compose([normalize])
-    #     ),
-    #     batch_size=batch_size,
-    #     shuffle=True,
-    #     num_workers=workers,
-    #     pin_memory=True,
-    # )
-    # val_loader = torch.utils.data.DataLoader(
-    #     CaptionDataset(
-    #         data_folder, data_name, "VAL", transform=transforms.Compose([normalize])
-    #     ),
-    #     batch_size=batch_size,
-    #     shuffle=True,
-    #     num_workers=workers,
-    #     pin_memory=True,
-    # )
     # Epochs
     for epoch in range(start_epoch, epochs):
 
         # Decay learning rate if there is no improvement for 8 consecutive epochs, and terminate training after 20
-        if epochs_since_improvement == 20:
+        if epochs_since_improvement == 5:
             break
-        if epochs_since_improvement > 0 and epochs_since_improvement % 8 == 0:
+        if epochs_since_improvement > 0 and epochs_since_improvement % 2 == 0:
             adjust_learning_rate(decoder_optimizer, 0.8)
             if fine_tune_encoder:
                 adjust_learning_rate(encoder_optimizer, 0.8)
@@ -187,13 +173,15 @@ def main():
         )
 
         # One epoch's validation
-        recent_bleu4 = validate(
+        recent_val_loss = validate(
             val_loader=val_loader, encoder=encoder, decoder=decoder, criterion=criterion
         )
 
         # Check if there was an improvement
-        is_best = recent_bleu4 > best_bleu4
-        best_bleu4 = max(recent_bleu4, best_bleu4)
+        # is_best = recent_bleu4 > best_bleu4
+        # best_bleu4 = max(recent_bleu4, best_bleu4)
+        is_best = recent_val_loss < best_val_loss
+        best_val_loss = min(recent_val_loss, best_val_loss)
         if not is_best:
             epochs_since_improvement += 1
             print("\nEpochs since last improvement: %d\n" % (epochs_since_improvement,))
@@ -209,7 +197,7 @@ def main():
             decoder,
             encoder_optimizer,
             decoder_optimizer,
-            recent_bleu4,
+            recent_val_loss,
             is_best,
         )
 
@@ -395,40 +383,6 @@ def validate(val_loader, encoder, decoder, criterion):
                         top5=top5accs,
                     )
                 )
-
-            # # Store references (true captions), and hypothesis (prediction) for each image
-            # # If for n images, we have n hypotheses, and references a, b, c... for each image, we need -
-            # # references = [[ref1a, ref1b, ref1c], [ref2a, ref2b], ...], hypotheses = [hyp1, hyp2, ...]
-
-            # # References
-            # allcaps = allcaps[sort_ind]  # because images were sorted in the decoder
-            # for j in range(allcaps.shape[0]):
-            #     img_caps = allcaps[j].tolist()
-            #     img_captions = list(
-            #         map(
-            #             lambda c: [
-            #                 w
-            #                 for w in c
-            #                 if w not in {word_map["<start>"], word_map["<pad>"]}
-            #             ],
-            #             img_caps,
-            #         )
-            #     )  # remove <start> and pads
-            #     references.append(img_captions)
-
-        #     # Hypotheses
-        #     _, preds = torch.max(scores_copy, dim=2)
-        #     preds = preds.tolist()
-        #     temp_preds = list()
-        #     for j, p in enumerate(preds):
-        #         temp_preds.append(preds[j][: decode_lengths[j]])  # remove pads
-        #     preds = temp_preds
-        #     hypotheses.extend(preds)
-
-        #     assert len(references) == len(hypotheses)
-
-        # # Calculate BLEU-4 scores
-        # bleu4 = corpus_bleu(references, hypotheses)
 
         print(
             "\n * LOSS - {loss.avg:.3f}, TOP-5 ACCURACY - {top5.avg:.3f}".format(
