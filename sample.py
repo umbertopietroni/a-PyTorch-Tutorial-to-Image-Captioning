@@ -25,7 +25,7 @@ def load_image(image_path, transform=None):
 
 def main():
     # Image preprocessing
-    brunello = False
+    brunello = True
 
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2",)
 
@@ -35,13 +35,13 @@ def main():
         )
         data_module.setup()
         test_loader = data_module.test_dataloader()
-        checkpoint = "BEST_checkpoint_brunello_loadgpt.pth.tar"  # model checkpoint
+        checkpoint = "BEST_checkpoint_brun_loadgpt_152.pth.tar"  # model checkpoint
     else:
         data_module = HMImageDataModule(
             tokenizer=tokenizer, batch_size=1, num_workers=1, collate=collate_fn,
         )
         data_module.setup()
-        test_loader = data_module.small_test_dataloader()
+        test_loader = data_module.test_dataloader()
         checkpoint = "BEST_checkpoint_hm_loadgpt.pth.tar"
 
     device = torch.device(
@@ -177,9 +177,11 @@ def main():
             if step > 200:
                 break
             step += 1
-
-        i = complete_seqs_scores.index(max(complete_seqs_scores))
-        seq = complete_seqs[i]
+        try:
+            i = complete_seqs_scores.index(max(complete_seqs_scores))
+            seq = complete_seqs[i]
+        except:
+            seq = seqs[0].tolist()
         # generated_sequence_list = seq.tolist()
         # Decode text
         gen_text = tokenizer.decode(seq, clean_up_tokenization_spaces=True)
@@ -195,8 +197,8 @@ def main():
             key = test_loader.dataset.idxtoImgid[batch_idx]
         results[key] = {"original": original}
         results[key]["generated"] = gen_text
-
-    with open("attention_baseline_{}.json".format(brunello), "w") as f:
+    name = "brunello" if brunello else "hm"
+    with open("attention_baseline_{}.json".format(name), "w") as f:
         json.dump(results, f, indent=4)
 
 
